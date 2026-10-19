@@ -21,7 +21,7 @@
 //! emit_event(env, EventName::PriceUpdate, &[&asset_sym], &(price, timestamp));
 //! ```
 
-use soroban_sdk::{symbol_short, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Env, Symbol, Vec};
 
 use crate::ContractError;
 
@@ -70,6 +70,12 @@ pub const EV_ASSET_INFO_SET: Symbol = symbol_short!("info_set");
 
 /// Price oracle: asset description was stored.
 pub const EV_ASSET_DESC_SET: Symbol = symbol_short!("desc_set");
+/// Adaptive AMM fee updated event.
+pub const EV_ADAPTIVE_FEE: Symbol = symbol_short!("adp_fee");
+/// Flash loan fees distributed event.
+pub const EV_FLASH_FEES_DISTRIBUTED: Symbol = symbol_short!("fl_fees");
+/// Governance proposal created event.
+pub const EV_PROPOSAL_CREATED: Symbol = symbol_short!("prop_new");
 
 /// Price oracle: emergency halt was toggled.
 pub const EV_EMERGENCY_HALT: Symbol = symbol_short!("emrg_halt");
@@ -143,6 +149,9 @@ pub const EV_BALLOT_OPENED: Symbol = symbol_short!("ball_open");
 /// Governance: a revocation ballot was closed.
 pub const EV_BALLOT_CLOSED: Symbol = symbol_short!("ball_clos");
 
+/// Remittance: fees were routed through the fee splitter.
+pub const EV_REMITTANCE_FEES_ROUTED: Symbol = symbol_short!("rem_fee_r");
+
 /// Governance: a proposal was vetoed by the Security Council.
 pub const EV_PROPOSAL_VETOED: Symbol = symbol_short!("prop_vet");
 
@@ -190,6 +199,15 @@ pub const EV_ANCHOR_PAYOUT: Symbol = symbol_short!("anc_paid");
 /// Escrow: the 24-hour anchor payout deadline elapsed, triggering an
 /// automatic refund of locked funds to the sender.
 pub const EV_PAYOUT_TIMEOUT: Symbol = symbol_short!("pay_tmout");
+
+/// Fees: the protocol fee range was changed by governance.
+pub const EV_PROTOCOL_FEE_CHANGED: Symbol = symbol_short!("fee_chg");
+
+/// Fees: the protocol fee was clamped to the floor during recalculation.
+pub const EV_PROTOCOL_FEE_FLOOR_ENFORCED: Symbol = symbol_short!("fee_flr");
+
+/// Treasury: a diversification plan was triggered for an asset.
+pub const EV_TREASURY_DIVERSIFICATION_TRIGGERED: Symbol = symbol_short!("trs_div");
 
 // ---------------------------------------------------------------------------
 // Core publishing function
@@ -351,7 +369,7 @@ pub fn emit_proposal_vetoed(
     vetoed_at: u64,
     reason: soroban_sdk::String,
 ) -> Result<(), ContractError> {
-    let proposal_id_sym = soroban_sdk::Symbol::new(env, &format!("prop_{}", proposal_id));
+    let proposal_id_sym = symbol_short!("proposal");
     
     let event = ProposalVetoedEvent {
         proposal_id,
@@ -397,7 +415,7 @@ pub fn emit_proposal_created(
     ipfs_cid: soroban_sdk::Bytes,
     created_at: u64,
 ) -> Result<(), ContractError> {
-    let proposal_id_sym = soroban_sdk::Symbol::new(env, &format!("prop_{}", proposal_id));
+    let proposal_id_sym = symbol_short!("proposal");
     
     let event = ProposalCreatedEvent {
         proposal_id,
@@ -418,6 +436,22 @@ pub fn emit_proposal_created(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Vault: a position was auto-deleveraged by the liquidation engine.
+pub const EV_VAULT_DELEVERAGED: Symbol = symbol_short!("vlt_dlvg");
+
+/// Emit a vault-deleveraged event.
+pub fn emit_vault_deleveraged(
+    env: &Env,
+    event: crate::vaults::liquidation::VaultDeleveragedEvent,
+) {
+    let _ = emit_event(
+        env,
+        EV_VAULT_DELEVERAGED,
+        &[],
+        event,
+    );
+}
 
 #[cfg(test)]
 mod tests {
@@ -567,6 +601,7 @@ mod tests {
             EV_UPGRADE_CANCELLED,
             EV_BALLOT_OPENED,
             EV_BALLOT_CLOSED,
+            EV_REMITTANCE_FEES_ROUTED,
             EV_PROPOSAL_VETOED,
         ];
         for name in names.iter() {

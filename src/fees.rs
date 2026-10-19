@@ -4,16 +4,36 @@
 //! `INTERIOR_SCALE` (10^14) before division, then normalize back to the
 //! standard 10^7 fixed-point footprint prior to ledger mutations.
 
-use crate::{AssetId, ContractData, ContractError, TimeLockedUpgradeContract, DATA_KEY};
+use crate::{
+    asset_id_to_symbol, AssetId, ContractData, ContractError, TimeLockedUpgradeContract,
+    DATA_KEY,
+};
+use crate::events::{emit_event, EV_PROTOCOL_FEE_CHANGED, EV_PROTOCOL_FEE_FLOOR_ENFORCED};
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
 pub const STANDARD_FIXED_POINT_SCALE: i128 = 10_000_000;
 pub const INTERIOR_FEE_PRECISION_SCALE: i128 = 100_000_000_000_000;
+pub const DYNAMIC_FEE_SCALE: u64 = 10_000_000;
+pub const MIN_DYNAMIC_FEE: u64 = 5_000;
+pub const LP_FEE_GROWTH_SCALE: i128 = INTERIOR_FEE_PRECISION_SCALE;
 
 /// Supported pool fee tiers in basis points: 0.05%, 0.30%, and 1.00%.
 pub const FEE_TIER_5_BPS: u32 = 5;
 pub const FEE_TIER_30_BPS: u32 = 30;
 pub const FEE_TIER_100_BPS: u32 = 100;
+
+/// Hardcoded protocol fee floor: 0.0001 (0.01%) = 1 basis point.
+pub const PROTOCOL_FEE_FLOOR_BPS: u32 = 1;
+
+/// Hardcoded absolute ceiling for any protocol swap fee: 1.00% = 100 basis points.
+///
+/// This ceiling is **immutable by construction** — it is a `const`, so there is
+/// deliberately no setter for it and no storage slot that could be written to
+/// raise it. Admin and governance fee-adjustment transactions revert with
+/// [`ContractError::ProtocolFeeCapExceeded`] whenever a requested fee would
+/// exceed it, so a compromised key or a malicious proposal can never configure
+/// the protocol to charge more than 1.00% on a swap.
+pub const MAX_PROTOCOL_FEE_BPS: u32 = 100;
 
 /// Collected fee split: 80% to LP token holders, 20% to protocol treasury.
 pub const LP_FEE_SHARE_BPS: u64 = 8_000;
@@ -95,6 +115,52 @@ pub struct DynamicFeeState {
     pub period_seconds: u64, // how often to recalculate (default: 3600 = 1 hour)
 }
 
+/// Event payload emitted when a protocol fee is clamped to the global floor.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProtocolFeeFloorEnforced {
+    pub asset: AssetId,
+    pub requested_fee_bps: u32,
+    pub enforced_fee_bps: u32,
+    pub floor_bps: u32,
+    pub timestamp: u64,
+}
+
+/// Immutable audit payload emitted on every accepted protocol fee change.
+///
+/// Records the previous and new fee alongside the hard cap that was enforced,
+/// so the fee-adjustment history is reconstructible from ledger events alone.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProtocolFeeChanged {
+    pub asset: AssetId,
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+    pub cap_bps: u32,
+    pub timestamp: u64,
+}
+
+/// Protocol treasury reserve concentration trigger.
+///
+/// `concentration_ratio_bps` is the ratio `V_asset / V_treasury` expressed in
+/// basis points. When it exceeds `40%` the plan returns the excess value that
+/// should be swapped into low-volatility stablecoin assets.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreasuryDiversificationPlan {
+    pub asset: AssetId,
+    pub asset_value: u64,
+    pub treasury_total: u64,
+    pub concentration_ratio_bps: u32,
+    pub threshold_bps: u32,
+    pub excess_value: u64,
+    pub swap_amount: u64,
+    pub stablecoin_basket: Vec<AssetId>,
+    pub stablecoin_allocations_bps: Vec<u32>,
+    pub diversified: bool,
+    pub timestamp: u64,
+}
+
 impl DynamicFeeState {
     pub fn new_default() -> Self {
         Self::new()
@@ -113,6 +179,105 @@ impl DynamicFeeState {
 /// Returns true if `fee_bps` is one of the supported pool fee tiers.
 pub fn is_valid_fee_tier(fee_bps: u32) -> bool {
     fee_bps == FEE_TIER_5_BPS || fee_bps == FEE_TIER_30_BPS || fee_bps == FEE_TIER_100_BPS
+}
+
+/// Return true if a fee is either a supported tier or the hardcoded safety floor.
+pub fn is_valid_protocol_fee_value(fee_bps: u32) -> bool {
+    fee_bps == PROTOCOL_FEE_FLOOR_BPS || is_valid_fee_tier(fee_bps)
+}
+
+/// Hardcoded diversification trigger threshold: a single treasury asset can
+/// account for up to 40% of all treasury value before diversification is needed.
+pub const TREASURY_DIVERSIFICATION_THRESHOLD_BPS: u32 = 4_000;
+
+/// Compute a single treasury asset's concentration ratio in basis points.
+///
+/// `R_asset = V_asset / V_treasury`, encoded as a percentage in basis points.
+pub fn calculate_asset_concentration_ratio(asset_value: u64, treasury_total: u64) -> Result<u32, ContractError> {
+    if treasury_total == 0 {
+        return Ok(0);
+    }
+
+    let ratio = u128::from(asset_value)
+        .checked_mul(10_000u128)
+        .ok_or(ContractError::Overflow)?
+        .checked_div(u128::from(treasury_total))
+        .ok_or(ContractError::DivisionByZero)?;
+
+    if ratio > u128::from(u32::MAX) {
+        return Ok(u32::MAX);
+    }
+
+    Ok(u32::try_from(ratio).map_err(|_| ContractError::Overflow)?)
+}
+
+/// Trigger a reserve diversification plan when a treasury asset exceeds the
+/// configured 40% concentration cap. The plan identifies the excess amount and
+/// distributes the rebalance across the supplied stablecoin basket.
+pub fn trigger_treasury_diversification(
+    env: &Env,
+    asset: AssetId,
+    asset_value: u64,
+    treasury_total: u64,
+    stablecoin_basket: &Vec<AssetId>,
+) -> Result<TreasuryDiversificationPlan, ContractError> {
+    if stablecoin_basket.is_empty() {
+        return Err(ContractError::InvalidInput);
+    }
+
+    let concentration_ratio_bps = calculate_asset_concentration_ratio(asset_value, treasury_total)?;
+    let threshold_bps = TREASURY_DIVERSIFICATION_THRESHOLD_BPS;
+    let diversified = concentration_ratio_bps > threshold_bps;
+
+    let excess_value = if diversified {
+        let threshold_value = (u128::from(treasury_total)
+            .checked_mul(u128::from(threshold_bps))
+            .ok_or(ContractError::Overflow)?
+            / 10_000u128)
+            as u64;
+
+        asset_value.saturating_sub(threshold_value)
+    } else {
+        0
+    };
+
+    let mut stablecoin_allocations_bps = Vec::new(env);
+    let basket_len = stablecoin_basket.len() as u32;
+    if basket_len > 0 {
+        let base = 10_000u32 / basket_len;
+        let remainder = 10_000u32 % basket_len;
+        for index in 0..basket_len {
+            let weight = if index < remainder { base + 1 } else { base };
+            stablecoin_allocations_bps.push_back(weight);
+        }
+    }
+
+    let plan = TreasuryDiversificationPlan {
+        asset,
+        asset_value,
+        treasury_total,
+        concentration_ratio_bps,
+        threshold_bps,
+        excess_value,
+        swap_amount: excess_value,
+        stablecoin_basket: stablecoin_basket.clone(),
+        stablecoin_allocations_bps,
+        diversified,
+        timestamp: env.ledger().timestamp(),
+    };
+
+    if diversified {
+        let asset_symbol = asset_id_to_symbol(env, asset);
+        emit_event(
+            env,
+            crate::events::EV_TREASURY_DIVERSIFICATION_TRIGGERED,
+            &[&asset_symbol],
+            plan.clone(),
+        )
+        .ok();
+    }
+
+    Ok(plan)
 }
 
 impl CorridorFeePool {
@@ -228,6 +393,137 @@ pub struct CorridorWeightProfile {
     pub dynamic_weight: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicFeeAccumulator {
+    pub base_fee: u64,
+    pub peak_fee: u64,
+    pub current_fee: u64,
+    pub lambda: u64,
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlashLoanFeeGrowth {
+    pub fee_growth_accumulator: i128,
+}
+
+impl FlashLoanFeeGrowth {
+    pub fn new() -> Self {
+        Self {
+            fee_growth_accumulator: 0,
+        }
+    }
+}
+
+/// Settles flash-loan fees against active LP shares and advances `f_acc`.
+/// The final allocation receives integer-rounding dust so no fee is stranded.
+pub fn settle_flash_loan_fee(
+    growth: &mut FlashLoanFeeGrowth,
+    flash_fee: u64,
+    lp_shares: Vec<u64>,
+) -> Result<Vec<u64>, ContractError> {
+    let total_lp = lp_shares.iter().try_fold(0_i128, |total, share| {
+        total
+            .checked_add(share as i128)
+            .ok_or(ContractError::Overflow)
+    })?;
+    if total_lp <= 0 || lp_shares.len() == 0 {
+        return Err(ContractError::DivisionByZero);
+    }
+
+    let fee = flash_fee as i128;
+    let fee_growth = fee
+        .checked_mul(LP_FEE_GROWTH_SCALE)
+        .ok_or(ContractError::Overflow)?
+        .checked_div(total_lp)
+        .ok_or(ContractError::DivisionByZero)?;
+    growth.fee_growth_accumulator = growth
+        .fee_growth_accumulator
+        .checked_add(fee_growth)
+        .ok_or(ContractError::Overflow)?;
+
+    let mut allocations = Vec::new(lp_shares.env());
+    let mut allocated = 0_u64;
+    let last_index = lp_shares.len() - 1;
+    for index in 0..lp_shares.len() {
+        let allocation = if index == last_index {
+            flash_fee
+                .checked_sub(allocated)
+                .ok_or(ContractError::Overflow)?
+        } else {
+            let share = lp_shares
+                .get(index)
+                .ok_or(ContractError::Overflow)? as i128;
+            fee
+                .checked_mul(share)
+                .ok_or(ContractError::Overflow)?
+                .checked_div(total_lp)
+                .ok_or(ContractError::DivisionByZero)?
+                .try_into()
+                .map_err(|_| ContractError::Overflow)?
+        };
+        allocated = allocated
+            .checked_add(allocation)
+            .ok_or(ContractError::Overflow)?;
+        allocations.push_back(allocation);
+    }
+
+    if allocated != flash_fee {
+        return Err(ContractError::Overflow);
+    }
+    Ok(allocations)
+}
+
+pub fn calculate_decayed_fee(
+    base_fee: u64,
+    peak_fee: u64,
+    lambda: u64,
+    elapsed_seconds: u64,
+) -> u64 {
+    let base_fee = base_fee.max(MIN_DYNAMIC_FEE);
+    if peak_fee <= base_fee || lambda == 0 || elapsed_seconds == 0 {
+        return peak_fee.max(base_fee);
+    }
+
+    let decay = libm::exp(
+        -((lambda as f64 / DYNAMIC_FEE_SCALE as f64) * elapsed_seconds as f64),
+    );
+    let variable_fee = ((peak_fee - base_fee) as f64 * decay) as u64;
+    base_fee
+        .saturating_add(variable_fee)
+        .max(MIN_DYNAMIC_FEE)
+}
+
+pub fn update_dynamic_fee_accumulator(
+    accumulator: &mut DynamicFeeAccumulator,
+    now: u64,
+) -> u64 {
+    let elapsed = now.saturating_sub(accumulator.last_updated);
+    accumulator.current_fee = calculate_decayed_fee(
+        accumulator.base_fee,
+        accumulator.peak_fee,
+        accumulator.lambda,
+        elapsed,
+    );
+    accumulator.last_updated = now;
+    accumulator.current_fee
+}
+
+pub fn record_pool_trade(
+    accumulator: &mut DynamicFeeAccumulator,
+    now: u64,
+    observed_peak_fee: u64,
+) -> u64 {
+    update_dynamic_fee_accumulator(accumulator, now);
+    if observed_peak_fee > accumulator.peak_fee {
+        accumulator.peak_fee = observed_peak_fee;
+        accumulator.current_fee = observed_peak_fee.max(MIN_DYNAMIC_FEE);
+    }
+    accumulator.current_fee.max(MIN_DYNAMIC_FEE)
+}
+
 /// Separate storage namespace for corridor weight profiles.
 #[contracttype]
 pub enum CorridorWeightKey {
@@ -331,7 +627,19 @@ pub fn update_volume_and_adjust_fee(env: &Env, asset: AssetId, trade_volume: u64
         
         // Calculate volume delta and adjust fee
         let new_fee = calculate_dynamic_fee(&volume_history, &dynamic_fee)?;
-        dynamic_fee.current_fee_bps = new_fee;
+        let enforced_fee = new_fee.max(PROTOCOL_FEE_FLOOR_BPS);
+        if enforced_fee != new_fee {
+            let event = ProtocolFeeFloorEnforced {
+                asset,
+                requested_fee_bps: new_fee,
+                enforced_fee_bps: enforced_fee,
+                floor_bps: PROTOCOL_FEE_FLOOR_BPS,
+                timestamp: env.ledger().timestamp(),
+            };
+            let asset_symbol = asset_id_to_symbol(env, asset);
+            emit_event(env, EV_PROTOCOL_FEE_FLOOR_ENFORCED, &[&asset_symbol], event).ok();
+        }
+        dynamic_fee.current_fee_bps = enforced_fee;
     } else {
         // Still in the same period, just add to current volume
         volume_history.current_period_volume = volume_history.current_period_volume
@@ -424,6 +732,22 @@ pub fn calculate_and_deduct_fee(amount: u128, fee_bps: u32) -> Result<(u128, u12
     Ok((amount_after_fees, fee_amount))
 }
 
+/// Emit the immutable audit event for an accepted protocol fee change.
+///
+/// Best-effort: an over-long topic list must never abort a fee write that has
+/// already passed the ceiling check, mirroring how the floor event is emitted.
+fn emit_protocol_fee_changed(env: &Env, asset: AssetId, old_fee_bps: u32, new_fee_bps: u32) {
+    let event = ProtocolFeeChanged {
+        asset,
+        old_fee_bps,
+        new_fee_bps,
+        cap_bps: MAX_PROTOCOL_FEE_BPS,
+        timestamp: env.ledger().timestamp(),
+    };
+    let asset_symbol = asset_id_to_symbol(env, asset);
+    emit_event(env, EV_PROTOCOL_FEE_CHANGED, &[&asset_symbol], event).ok();
+}
+
 /// Admin function to update dynamic fee configuration
 pub fn set_dynamic_fee_config(
     env: &Env,
@@ -442,11 +766,19 @@ pub fn set_dynamic_fee_config(
     if data.admin != *caller {
         return Err(ContractError::NotAdmin);
     }
-    
-    // Validate bounds
-    if !is_valid_fee_tier(min_fee_bps)
-        || !is_valid_fee_tier(max_fee_bps)
-        || min_fee_bps >= max_fee_bps
+
+    let clamped_min = min_fee_bps.max(PROTOCOL_FEE_FLOOR_BPS);
+    let clamped_max = max_fee_bps.max(clamped_min);
+
+    // Hard, immutable ceiling (issue #922): no admin, governance or timelocked
+    // action may raise the configurable protocol fee above the hardcoded 1.00%.
+    if clamped_min > MAX_PROTOCOL_FEE_BPS || clamped_max > MAX_PROTOCOL_FEE_BPS {
+        return Err(ContractError::ProtocolFeeCapExceeded);
+    }
+
+    if !is_valid_protocol_fee_value(clamped_min)
+        || !is_valid_protocol_fee_value(clamped_max)
+        || clamped_min >= clamped_max
     {
         return Err(ContractError::InvalidVarianceConfig);
     }
@@ -459,13 +791,32 @@ pub fn set_dynamic_fee_config(
         .instance()
         .get(&fee_key)
         .unwrap_or(DynamicFeeState::new());
-    
-    dynamic_fee.min_fee_bps = min_fee_bps;
-    dynamic_fee.max_fee_bps = max_fee_bps;
+
+    let previous_cap_bps = dynamic_fee.max_fee_bps;
+
+    dynamic_fee.min_fee_bps = clamped_min;
+    dynamic_fee.max_fee_bps = clamped_max;
     dynamic_fee.period_seconds = period_seconds;
+    if dynamic_fee.current_fee_bps < PROTOCOL_FEE_FLOOR_BPS {
+        let original = dynamic_fee.current_fee_bps;
+        dynamic_fee.current_fee_bps = PROTOCOL_FEE_FLOOR_BPS;
+        let event = ProtocolFeeFloorEnforced {
+            asset,
+            requested_fee_bps: original,
+            enforced_fee_bps: PROTOCOL_FEE_FLOOR_BPS,
+            floor_bps: PROTOCOL_FEE_FLOOR_BPS,
+            timestamp: env.ledger().timestamp(),
+        };
+        let asset_symbol = asset_id_to_symbol(env, asset);
+        emit_event(env, EV_PROTOCOL_FEE_FLOOR_ENFORCED, &[&asset_symbol], event).ok();
+    }
     
     env.storage().instance().set(&fee_key, &dynamic_fee);
-    
+
+    if previous_cap_bps != clamped_max {
+        emit_protocol_fee_changed(env, asset, previous_cap_bps, clamped_max);
+    }
+
     Ok(())
 }
 
@@ -489,9 +840,6 @@ pub fn governance_adjust_fee_tier(
     if data.admin != *governance {
         return Err(ContractError::NotAdmin);
     }
-    if !is_valid_fee_tier(new_fee_bps) {
-        return Err(ContractError::InvalidVarianceConfig);
-    }
 
     let fee_key = FeesStorageKey::DynamicFee(asset);
     let mut dynamic_fee: DynamicFeeState = env
@@ -500,14 +848,43 @@ pub fn governance_adjust_fee_tier(
         .get(&fee_key)
         .unwrap_or(DynamicFeeState::new());
 
-    if new_fee_bps < dynamic_fee.min_fee_bps || new_fee_bps > dynamic_fee.max_fee_bps {
+    let requested_fee_bps = new_fee_bps;
+
+    // Hard, immutable ceiling (issue #922): a governance vote cannot raise the
+    // active protocol fee above the hardcoded 1.00% maximum.
+    if requested_fee_bps > MAX_PROTOCOL_FEE_BPS {
+        return Err(ContractError::ProtocolFeeCapExceeded);
+    }
+
+    let previous_fee_bps = dynamic_fee.current_fee_bps;
+    let enforced_fee_bps = requested_fee_bps.max(PROTOCOL_FEE_FLOOR_BPS);
+    if enforced_fee_bps != requested_fee_bps {
+        let event = ProtocolFeeFloorEnforced {
+            asset,
+            requested_fee_bps,
+            enforced_fee_bps,
+            floor_bps: PROTOCOL_FEE_FLOOR_BPS,
+            timestamp: env.ledger().timestamp(),
+        };
+        let asset_symbol = asset_id_to_symbol(env, asset);
+        emit_event(env, EV_PROTOCOL_FEE_FLOOR_ENFORCED, &[&asset_symbol], event).ok();
+    }
+
+    if !is_valid_protocol_fee_value(enforced_fee_bps) {
+        return Err(ContractError::InvalidVarianceConfig);
+    }
+    if enforced_fee_bps < dynamic_fee.min_fee_bps || enforced_fee_bps > dynamic_fee.max_fee_bps {
         return Err(ContractError::InvalidVarianceConfig);
     }
 
-    dynamic_fee.current_fee_bps = new_fee_bps;
+    dynamic_fee.current_fee_bps = enforced_fee_bps;
     env.storage().instance().set(&fee_key, &dynamic_fee);
 
-    Ok(new_fee_bps)
+    if previous_fee_bps != enforced_fee_bps {
+        emit_protocol_fee_changed(env, asset, previous_fee_bps, enforced_fee_bps);
+    }
+
+    Ok(enforced_fee_bps)
 }
 
 // ---------------------------------------------------------------------------
@@ -735,7 +1112,8 @@ pub fn distribute_flash_fees(
 mod tests {
     use super::*;
     use crate::{TimeLockedUpgradeContract, TimeLockedUpgradeContractClient};
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::TryFromVal;
 
     fn setup() -> (Env, TimeLockedUpgradeContractClient<'static>, Address, Address) {
         let env = Env::default();
@@ -778,6 +1156,7 @@ mod tests {
 
     #[test]
     fn corridor_weight_profile_is_isolated_from_fee_pool() {
+
         let (_, client, admin, _) = setup();
         let asset = 3897123275;
 
@@ -797,7 +1176,8 @@ mod tests {
         let stored_profile = client.get_corridor_weight(&asset);
         assert_eq!(stored_profile.base_weight, 70);
         assert_eq!(stored_profile.dynamic_weight, 30);
-    }
+    
+}
 
     #[test]
     fn non_admin_cannot_edit_corridor_weight_profile() {
@@ -887,5 +1267,193 @@ mod tests {
             normalize_to_fixed_point_footprint(too_large),
             Err(ContractError::Overflow)
         );
+    }
+
+    #[test]
+    fn dynamic_fee_decays_toward_baseline() {
+        let fee = calculate_decayed_fee(
+            DYNAMIC_FEE_SCALE,
+            2 * DYNAMIC_FEE_SCALE,
+            DYNAMIC_FEE_SCALE,
+            1,
+        );
+        assert!(fee > DYNAMIC_FEE_SCALE);
+        assert!(fee < 2 * DYNAMIC_FEE_SCALE);
+    }
+
+    #[test]
+    fn dynamic_fee_respects_protocol_floor() {
+        assert_eq!(
+            calculate_decayed_fee(0, 0, DYNAMIC_FEE_SCALE, 1),
+            MIN_DYNAMIC_FEE
+        );
+        assert_eq!(
+            calculate_decayed_fee(
+                MIN_DYNAMIC_FEE,
+                DYNAMIC_FEE_SCALE,
+                DYNAMIC_FEE_SCALE,
+                u64::MAX,
+            ),
+            MIN_DYNAMIC_FEE
+        );
+    }
+
+    #[test]
+    fn pool_trade_updates_and_records_new_peak() {
+        let mut accumulator = DynamicFeeAccumulator {
+            base_fee: DYNAMIC_FEE_SCALE,
+            peak_fee: 2 * DYNAMIC_FEE_SCALE,
+            current_fee: 2 * DYNAMIC_FEE_SCALE,
+            lambda: DYNAMIC_FEE_SCALE,
+            last_updated: 0,
+        };
+
+        assert_eq!(
+            record_pool_trade(&mut accumulator, 1, 3 * DYNAMIC_FEE_SCALE),
+            3 * DYNAMIC_FEE_SCALE
+        );
+        assert_eq!(accumulator.peak_fee, 3 * DYNAMIC_FEE_SCALE);
+    }
+
+    // ── Protocol fee cap safety guard (issue #922) ─────────────────────────
+
+    #[test]
+    fn protocol_fee_cap_rejects_config_above_ceiling() {
+        let (_env, client, admin, _) = setup();
+        let asset: AssetId = 3897123275;
+
+        let result = client.try_set_dynamic_fee_config(
+            &admin,
+            &asset,
+            &5u32,
+            &(MAX_PROTOCOL_FEE_BPS + 1),
+            &3_600u64,
+        );
+
+        assert_eq!(result, Err(Ok(ContractError::ProtocolFeeCapExceeded)));
+    }
+
+    #[test]
+    fn protocol_fee_cap_allows_config_at_ceiling() {
+        let (_env, client, admin, _) = setup();
+        let asset: AssetId = 3897123275;
+
+        let result = client.try_set_dynamic_fee_config(
+            &admin,
+            &asset,
+            &5u32,
+            &MAX_PROTOCOL_FEE_BPS,
+            &3_600u64,
+        );
+
+        assert_eq!(result, Ok(Ok(())));
+    }
+
+    #[test]
+    fn protocol_fee_cap_allows_config_below_ceiling() {
+        let (_env, client, admin, _) = setup();
+        let asset: AssetId = 3897123275;
+
+        let result =
+            client.try_set_dynamic_fee_config(&admin, &asset, &5u32, &30u32, &3_600u64);
+
+        assert_eq!(result, Ok(Ok(())));
+    }
+
+    #[test]
+    fn protocol_fee_cap_rejects_non_admin_config() {
+        let (_env, client, _admin, attacker) = setup();
+        let asset: AssetId = 3897123275;
+
+        let result =
+            client.try_set_dynamic_fee_config(&attacker, &asset, &5u32, &30u32, &3_600u64);
+
+        assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
+    }
+
+    #[test]
+    fn protocol_fee_cap_rejects_governance_adjustment_above_ceiling() {
+        let (_env, client, admin, _) = setup();
+        let asset: AssetId = 3897123275;
+        client.set_dynamic_fee_config(&admin, &asset, &5u32, &30u32, &3_600u64);
+
+        let result = client.try_governance_adjust_fee_tier(
+            &admin,
+            &asset,
+            &(MAX_PROTOCOL_FEE_BPS + 1),
+        );
+
+        assert_eq!(result, Err(Ok(ContractError::ProtocolFeeCapExceeded)));
+    }
+
+    #[test]
+    fn protocol_fee_cap_allows_governance_adjustment_at_ceiling() {
+        let (_env, client, admin, _) = setup();
+        let asset: AssetId = 3897123275;
+        client.set_dynamic_fee_config(&admin, &asset, &5u32, &MAX_PROTOCOL_FEE_BPS, &3_600u64);
+
+        let result =
+            client.try_governance_adjust_fee_tier(&admin, &asset, &MAX_PROTOCOL_FEE_BPS);
+
+        assert_eq!(result, Ok(Ok(MAX_PROTOCOL_FEE_BPS)));
+    }
+
+    #[test]
+    fn protocol_fee_cap_rejects_non_admin_governance_adjustment() {
+        let (_env, client, _admin, attacker) = setup();
+        let asset: AssetId = 3897123275;
+
+        let result = client.try_governance_adjust_fee_tier(&attacker, &asset, &30u32);
+
+        assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
+    }
+
+    #[test]
+    fn protocol_fee_change_emits_audit_event_with_old_and_new_fee() {
+        let (env, client, admin, _) = setup();
+        let asset: AssetId = 3897123275;
+
+        // Move the ceiling down, then back up to the hard cap so the second
+        // accepted write produces a distinct old → new audit record.
+        client.set_dynamic_fee_config(&admin, &asset, &5u32, &30u32, &3_600u64);
+        client.set_dynamic_fee_config(&admin, &asset, &5u32, &MAX_PROTOCOL_FEE_BPS, &3_600u64);
+
+        let events = env.events().all();
+        let mut saw_change = false;
+        for index in 0..events.len() {
+            let (_contract, _topics, data) = events.get(index).unwrap();
+            if let Ok(event) = ProtocolFeeChanged::try_from_val(&env, &data) {
+                if event.old_fee_bps == 30
+                    && event.new_fee_bps == MAX_PROTOCOL_FEE_BPS
+                    && event.cap_bps == MAX_PROTOCOL_FEE_BPS
+                {
+                    saw_change = true;
+                }
+            }
+        }
+
+        assert!(saw_change, "expected a ProtocolFeeChanged audit event");
+    }
+
+    #[test]
+    fn protocol_fee_change_emits_audit_event_on_governance_adjustment() {
+        let (env, client, admin, _) = setup();
+        let asset: AssetId = 3897123275;
+        client.set_dynamic_fee_config(&admin, &asset, &5u32, &30u32, &3_600u64);
+
+        client.governance_adjust_fee_tier(&admin, &asset, &30u32);
+
+        let events = env.events().all();
+        let mut saw_change = false;
+        for index in 0..events.len() {
+            let (_contract, _topics, data) = events.get(index).unwrap();
+            if let Ok(event) = ProtocolFeeChanged::try_from_val(&env, &data) {
+                if event.old_fee_bps == 5 && event.new_fee_bps == 30 {
+                    saw_change = true;
+                }
+            }
+        }
+
+        assert!(saw_change, "expected a ProtocolFeeChanged audit event");
     }
 }

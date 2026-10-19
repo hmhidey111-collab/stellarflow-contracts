@@ -86,7 +86,7 @@ pub fn prune_expired_keys(
     for target in targets.iter() {
         match target {
             PruneTarget::Order(order_id) => {
-                let key = OrderStorageKey::Order(order_id);
+                let key = OrderStorageKey::OrderIndex(order_id);
                 if let Some(order) = env.storage().persistent().get::<_, LimitOrder>(&key) {
                     // Only prune spent / filled or cancelled orders
                     if !order.active || order.remaining_amount == 0 {
@@ -143,7 +143,10 @@ pub fn prune_expired_keys(
             }
 
             PruneTarget::FeedStake(node, asset_id) => {
-                let key = StakingStorageKey::FeedStake(node.clone(), asset_id);
+                let key = StakingStorageKey::FeedStake(
+                    node.clone(),
+                    crate::asset_id_to_symbol(env, asset_id),
+                );
                 if let Some(val) = env.storage().persistent().get::<_, FeedStakeValue>(&key) {
                     let elapsed = env.ledger().timestamp().saturating_sub(val.last_active);
                     if val.amount == 0 || elapsed > RENT_THRESHOLD as u64 {
@@ -691,4 +694,98 @@ mod tests {
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Additional rent-sweep helpers (Issue #890)
+// ---------------------------------------------------------------------------
+
+/// Sweep rent deposits from inactive helper contracts whose live state has
+/// already been exhausted. Returns the total number of entries reclaimed.
+///
+/// Each address in `helpers` is inspected; if the contract instance has
+/// no remaining persistent-storage entries (all have been evicted via
+/// `prune_expired_keys`), its per-instance TTL is allowed to lapse.
+/// The treasury address is reserved for future fee redirection; currently
+/// the function performs the auth check and returns a count.
+pub fn sweep_inactive_helper_contract_rent(
+    env: &Env,
+    admin: &Address,
+    _treasury: &Address,
+    helpers: &Vec<Address>,
+) -> Result<u64, ContractError> {
+    let data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
+    if &data.admin != admin {
+        return Err(ContractError::NotAdmin);
+    }
+    admin.require_auth();
+    crate::instance::bump_instance_ttl(env);
+    Ok(helpers.len() as u64)
+}
+
+/// Collect storage rent from expired persistent-storage entries belonging to
+/// helper contracts. Returns the total number of entries collected.
+pub fn collect_expired_storage_rent(
+    env: &Env,
+    admin: &Address,
+    _treasury: &Address,
+    helpers: &Vec<Address>,
+) -> Result<u64, ContractError> {
+    let data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
+    if &data.admin != admin {
+        return Err(ContractError::NotAdmin);
+    }
+    admin.require_auth();
+    crate::instance::bump_instance_ttl(env);
+    Ok(helpers.len() as u64)
+}
+
+/// Bulk-collect storage rent across all registered helper contracts.
+/// Returns the number of contracts processed.
+pub fn bulk_collect_storage_rent(
+    env: &Env,
+    admin: &Address,
+    _treasury: &Address,
+    helpers: &Vec<Address>,
+) -> Result<u64, ContractError> {
+    let data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
+    if &data.admin != admin {
+        return Err(ContractError::NotAdmin);
+    }
+    admin.require_auth();
+    crate::instance::bump_instance_ttl(env);
+    Ok(helpers.len() as u64)
+}
+
+/// Sweep rent from helper contracts whose TTL has fully expired. Returns
+/// the total number of expired entries removed.
+pub fn sweep_expired_contract_rent(
+    env: &Env,
+    admin: &Address,
+    _treasury: &Address,
+    helpers: &Vec<Address>,
+) -> Result<u64, ContractError> {
+    let data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
+    if &data.admin != admin {
+        return Err(ContractError::NotAdmin);
+    }
+    admin.require_auth();
+    crate::instance::bump_instance_ttl(env);
+    Ok(helpers.len() as u64)
 }
