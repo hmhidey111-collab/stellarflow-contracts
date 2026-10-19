@@ -1,3 +1,7 @@
+pub mod fund_router;
+pub mod dynamic;
+pub mod multihop;
+
 use soroban_sdk::{contract, contractimpl, Env, Symbol, Address};
 
 #[contract]
@@ -27,6 +31,7 @@ impl RouterContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
 
     #[test]
     fn test_quote_exact_input_view() {
